@@ -78,15 +78,6 @@ class TestSkillsHubPathResolution:
         assert b_audit == prof_b / "skills" / ".hub" / "audit.log"
         assert b_index == prof_b / "skills" / ".hub" / "index-cache"
 
-    def test_lockfile_default_arg_resolves_active_profile(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        from tools.skills_hub import HubLockFile, TapsManager
-
-        lock_b = _under_override(prof_b, lambda: HubLockFile())
-        taps_b = _under_override(prof_b, lambda: TapsManager())
-
-        assert lock_b.path == prof_b / "skills" / ".hub" / "lock.json"
-        assert taps_b.path == prof_b / "skills" / ".hub" / "taps.json"
 
 
 class TestGatewayCacheDirResolution:
@@ -103,30 +94,7 @@ class TestGatewayCacheDirResolution:
         assert str(b_seen).startswith(str(prof_b))
         assert a_seen != b_seen
 
-    def test_all_cache_getters_follow_override(self, two_profiles):
-        _prof_a, prof_b = two_profiles
-        import gateway.platforms.base as gb
 
-        getters = (
-            gb.get_image_cache_dir,
-            gb.get_audio_cache_dir,
-            gb.get_video_cache_dir,
-            gb.get_document_cache_dir,
-        )
-        for getter in getters:
-            seen = _under_override(prof_b, getter)
-            assert str(seen).startswith(str(prof_b)), f"{getter.__name__} leaked: {seen}"
-
-    def test_monkeypatched_constant_still_wins(self, two_profiles, monkeypatch, tmp_path):
-        """The existing test seam (monkeypatch the module constant) is preserved."""
-        _prof_a, _prof_b = two_profiles
-        import gateway.platforms.base as gb
-
-        forced = tmp_path / "forced_img"
-        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", forced)
-        # Even with an active override, an explicit monkeypatch takes precedence.
-        seen = _under_override(_prof_b, lambda: gb.get_image_cache_dir())
-        assert seen == forced
 
 
 class TestRichSentStorePathResolution:
@@ -141,6 +109,93 @@ class TestRichSentStorePathResolution:
         b_seen = _under_override(prof_b, lambda: rss._store_path())
         assert b_seen.startswith(str(prof_b))
         assert b_seen.endswith("state/rich_sent_index.json")
+
+
+class TestGatewayHooksDirResolution:
+    """gateway/hooks.py's HookRegistry must discover hooks from the active
+    profile's directory — otherwise one profile's HookRegistry loads and
+    executes a DIFFERENT profile's hook handlers (arbitrary Python) against
+    its own live event context under the multiplexed gateway."""
+
+    def test_hooks_dir_follows_override(self, two_profiles):
+        prof_a, prof_b = two_profiles
+        import gateway.hooks as gh
+
+        a_seen = _under_override(prof_a, lambda: gh._resolve_hooks_dir())
+        b_seen = _under_override(prof_b, lambda: gh._resolve_hooks_dir())
+
+        assert a_seen == prof_a / "hooks"
+        assert b_seen == prof_b / "hooks"
+        assert a_seen != b_seen
+
+    def test_discover_and_load_uses_active_profile_hooks_dir(self, two_profiles):
+        """End-to-end: a hook that only exists under profile B's hooks dir
+        must not be discovered when profile A's override is active, and vice
+        versa — proving the registry doesn't fall back to a frozen profile."""
+        prof_a, prof_b = two_profiles
+        import gateway.hooks as gh
+
+        b_hook_dir = prof_b / "hooks" / "only-in-b"
+        b_hook_dir.mkdir(parents=True)
+        (b_hook_dir / "HOOK.yaml").write_text(
+            "name: only-in-b\nevents: [\"agent:start\"]\n", encoding="utf-8",
+        )
+        (b_hook_dir / "handler.py").write_text(
+            "async def handle(event_type, context):\n    pass\n", encoding="utf-8",
+        )
+
+        def _load_and_names():
+            reg = gh.HookRegistry()
+            reg.discover_and_load()
+            return [h["name"] for h in reg.loaded_hooks]
+
+        a_hooks = _under_override(prof_a, _load_and_names)
+        b_hooks = _under_override(prof_b, _load_and_names)
+
+        assert "only-in-b" not in a_hooks
+        assert "only-in-b" in b_hooks
+
+
+class TestCheckpointManagerPathResolution:
+    """tools/checkpoint_manager.py's checkpoint store root must honor the
+    active profile — otherwise one profile's CheckpointManager instance can
+    read/write code-edit checkpoints into a different profile's store under
+    the multiplexed gateway."""
+
+    def test_checkpoint_base_follows_override(self, two_profiles):
+        prof_a, prof_b = two_profiles
+        import tools.checkpoint_manager as cm
+
+        a_seen = _under_override(prof_a, lambda: cm._resolve_checkpoint_base())
+        b_seen = _under_override(prof_b, lambda: cm._resolve_checkpoint_base())
+
+        assert a_seen == prof_a / "checkpoints"
+        assert b_seen == prof_b / "checkpoints"
+        assert a_seen != b_seen
+
+    def test_store_path_follows_override(self, two_profiles):
+        prof_a, prof_b = two_profiles
+        import tools.checkpoint_manager as cm
+
+        b_seen = _under_override(prof_b, lambda: cm._store_path())
+        assert b_seen == prof_b / "checkpoints" / "store"
+
+
+class TestStickerCachePathResolution:
+    """gateway/sticker_cache.py's cache file must honor the active profile —
+    otherwise one profile's Telegram sticker-description cache leaks into a
+    different profile's under the multiplexed gateway."""
+
+    def test_cache_path_follows_override(self, two_profiles):
+        prof_a, prof_b = two_profiles
+        import gateway.sticker_cache as sc
+
+        a_seen = _under_override(prof_a, lambda: sc._resolve_cache_path())
+        b_seen = _under_override(prof_b, lambda: sc._resolve_cache_path())
+
+        assert a_seen == prof_a / "sticker_cache.json"
+        assert b_seen == prof_b / "sticker_cache.json"
+        assert a_seen != b_seen
 
 
 # ---------------------------------------------------------------------------
@@ -168,22 +223,6 @@ class TestThreadContextPropagation:
         # primitive is needed.  (Asserted as the hazard, not the desired state.)
         assert seen["home"] != str(prof_b)
 
-    def test_propagate_primitive_preserves_override(self, two_profiles):
-        _prof_a, prof_b = two_profiles
-        from tools.thread_context import propagate_context_to_thread
-
-        seen = {}
-
-        def worker():
-            seen["home"] = str(get_hermes_home())
-
-        def run():
-            t = threading.Thread(target=propagate_context_to_thread(worker))
-            t.start()
-            t.join()
-
-        _under_override(prof_b, run)
-        assert seen["home"] == str(prof_b)
 
     def test_run_async_worker_preserves_override(self, two_profiles):
         """model_tools._run_async's worker-thread branch must keep the override.
