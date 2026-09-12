@@ -3133,70 +3133,102 @@ def _iter_pool_sockets(client: Any):
 
     httpcore 1.x stores the concrete HTTP11/HTTP2 connection under
     ``conn._connection``; older versions exposed stream attributes directly
-    on the pool entry. Keep the traversal defensive because these are private
-    transport internals and vary across httpx/httpcore releases.
+    on the pool entry. HTTPX may route direct requests through scheme mounts,
+    so inspect both the default transport and every mounted transport. Keep
+    the traversal defensive because these are private transport internals and
+    vary across httpx/httpcore releases.
     """
+
+    def _getattr_or_none(obj: Any, name: str) -> Any:
+        try:
+            return getattr(obj, name, None)
+        except Exception:
+            return None
+
     try:
         http_client = getattr(client, "_client", None)
-        if http_client is None:
-            return
-        transport = getattr(http_client, "_transport", None)
-        if transport is None:
-            return
-        pool = getattr(transport, "_pool", None)
-        if pool is None:
-            return
-        connections = (
-            getattr(pool, "_connections", None)
-            or getattr(pool, "_pool", None)
-            or []
-        )
     except Exception:
         return
+    if http_client is None:
+        return
 
-    seen: set[int] = set()
-    for conn in list(connections):
-        candidates = [conn]
-        inner = getattr(conn, "_connection", None)
-        if inner is not None:
-            candidates.append(inner)
-        for candidate in candidates:
-            stream = (
-                getattr(candidate, "_network_stream", None)
-                or getattr(candidate, "_stream", None)
-            )
-            if stream is None:
+    transports = []
+    default_transport = _getattr_or_none(http_client, "_transport")
+    if default_transport is not None:
+        transports.append(default_transport)
+    mounts = _getattr_or_none(http_client, "_mounts")
+    if mounts is not None:
+        try:
+            transports.extend(list(mounts.values()))
+        except Exception:
+            # A custom mapping may fail while being inspected. The default
+            # transport remains independently inspectable.
+            pass
+
+    seen_transports: set[int] = set()
+    seen_pools: set[int] = set()
+    seen_connections: set[int] = set()
+    seen_sockets: set[int] = set()
+    for transport in transports:
+        if transport is None or id(transport) in seen_transports:
+            continue
+        seen_transports.add(id(transport))
+        pool = _getattr_or_none(transport, "_pool")
+        if pool is None or id(pool) in seen_pools:
+            continue
+        seen_pools.add(id(pool))
+        connections = _getattr_or_none(pool, "_connections")
+        if connections is None:
+            connections = _getattr_or_none(pool, "_pool")
+        try:
+            connection_entries = list(connections) if connections is not None else []
+        except Exception:
+            continue
+
+        for conn in connection_entries:
+            if id(conn) in seen_connections:
                 continue
-            sock = getattr(stream, "_sock", None)
-            if sock is None:
-                get_extra_info = getattr(stream, "get_extra_info", None)
-                if callable(get_extra_info):
-                    try:
-                        sock = get_extra_info("socket")
-                    except Exception:
-                        sock = None
-            if sock is None:
-                wrapped = getattr(stream, "stream", None)
-                if wrapped is not None:
-                    sock = getattr(wrapped, "_sock", None)
-            if sock is None:
-                # anyio-backed streams expose the raw socket through
-                # SocketAttribute.raw_socket when available.
-                wrapped = getattr(stream, "_stream", None)
-                extra = getattr(wrapped, "extra", None)
-                if callable(extra):
-                    try:
-                        from anyio.abc import SocketAttribute
-                        sock = extra(SocketAttribute.raw_socket)
-                    except Exception:
-                        sock = None
-            if sock is None:
-                continue
-            marker = id(sock)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            yield sock
+            seen_connections.add(id(conn))
+            candidates = [conn]
+            inner = _getattr_or_none(conn, "_connection")
+            if inner is not None:
+                candidates.append(inner)
+            for candidate in candidates:
+                stream = _getattr_or_none(candidate, "_network_stream")
+                if stream is None:
+                    stream = _getattr_or_none(candidate, "_stream")
+                if stream is None:
+                    continue
+                sock = _getattr_or_none(stream, "_sock")
+                if sock is None:
+                    get_extra_info = _getattr_or_none(stream, "get_extra_info")
+                    if callable(get_extra_info):
+                        try:
+                            sock = get_extra_info("socket")
+                        except Exception:
+                            sock = None
+                if sock is None:
+                    wrapped = _getattr_or_none(stream, "stream")
+                    if wrapped is not None:
+                        sock = _getattr_or_none(wrapped, "_sock")
+                if sock is None:
+                    # anyio-backed streams expose the raw socket through
+                    # SocketAttribute.raw_socket when available.
+                    wrapped = _getattr_or_none(stream, "_stream")
+                    extra = _getattr_or_none(wrapped, "extra")
+                    if callable(extra):
+                        try:
+                            from anyio.abc import SocketAttribute
+                            sock = extra(SocketAttribute.raw_socket)
+                        except Exception:
+                            sock = None
+                if sock is None:
+                    continue
+                marker = id(sock)
+                if marker in seen_sockets:
+                    continue
+                seen_sockets.add(marker)
+                yield sock
 
 
 def cleanup_dead_connections(agent) -> bool:
